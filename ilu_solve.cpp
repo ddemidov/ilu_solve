@@ -84,8 +84,10 @@ struct sptr_solver {
 
         // numa-touch order vector.
         for(int64_t l = 0; l < nlev; ++l) {
+            int64_t lev_beg = start[l];
+            int64_t lev_end = start[l+1];
 #pragma omp parallel for
-            for(int64_t r = start[l]; r < start[l+1]; ++r) {
+            for(int64_t r = lev_beg; r < lev_end; ++r) {
                 order[r] = 0;
             }
         }
@@ -102,8 +104,10 @@ struct sptr_solver {
         val.resize(_ptr[n], false);
 
         for(int64_t l = 0; l < nlev; ++l) {
+            int64_t lev_beg = start[l];
+            int64_t lev_end = start[l+1];
 #pragma omp parallel for
-            for(int64_t r = start[l]; r < start[l+1]; ++r) {
+            for(int64_t r = lev_beg; r < lev_end; ++r) {
                 int64_t i = order[r];
                 ptr[r+1] = _ptr[i+1] - _ptr[i];
             }
@@ -112,8 +116,10 @@ struct sptr_solver {
         std::partial_sum(ptr.data(), ptr.data() + n + 1, ptr.data());
 
         for(int64_t l = 0; l < nlev; ++l) {
+            int64_t lev_beg = start[l];
+            int64_t lev_end = start[l+1];
 #pragma omp parallel for
-            for(int64_t r = start[l]; r < start[l+1]; ++r) {
+            for(int64_t r = lev_beg; r < lev_end; ++r) {
                 int64_t i = order[r];
                 int64_t h = ptr[r];
                 for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
@@ -128,8 +134,10 @@ struct sptr_solver {
     void solve(amgcl::backend::numa_vector<double> &x) const {
         if (D) {
             for(int64_t l = 0; l < nlev; ++l) {
+                int64_t lev_beg = start[l];
+                int64_t lev_end = start[l+1];
 #pragma omp parallel for
-                for(int64_t r = start[l]; r < start[l+1]; ++r) {
+                for(int64_t r = lev_beg; r < lev_end; ++r) {
                     int64_t i = order[r];
                     double X = 0;
                     for(int64_t j = ptr[r], e = ptr[r+1]; j < e; ++j)
@@ -139,8 +147,10 @@ struct sptr_solver {
             }
         } else {
             for(int64_t l = 0; l < nlev; ++l) {
+                int64_t lev_beg = start[l];
+                int64_t lev_end = start[l+1];
 #pragma omp parallel for
-                for(int64_t r = start[l]; r < start[l+1]; ++r) {
+                for(int64_t r = lev_beg; r < lev_end; ++r) {
                     int64_t i = order[r];
                     double X = 0;
                     for(int64_t j = ptr[r], e = ptr[r+1]; j < e; ++j)
