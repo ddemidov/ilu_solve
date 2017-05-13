@@ -15,7 +15,7 @@ void serial_solve(int64_t n,
         std::vector<int64_t> const &Ucol,
         std::vector<double>  const &Uval,
         std::vector<double>  const &D,
-        std::vector<double>        &x
+        amgcl::backend::numa_vector<double> &x
         )
 {
     for(int64_t i = 0; i < n; i++) {
@@ -115,7 +115,7 @@ struct sptr_solver {
         }
     }
 
-    void solve(std::vector<double> &x) const {
+    void solve(amgcl::backend::numa_vector<double> &x) const {
         if (D) {
             for(int64_t l = 0; l < nlev; ++l) {
 #pragma omp parallel for
@@ -163,7 +163,7 @@ class ilu_solver {
         {
         }
 
-        void solve(std::vector<double> &x) const {
+        void solve(amgcl::backend::numa_vector<double> &x) const {
             L.solve(x);
             U.solve(x);
         }
@@ -194,8 +194,11 @@ int main(int argc, char *argv[]) {
         amgcl::io::read_crs(ufile, n, Uptr, Ucol, Uval);
     }
 
-    std::vector<double> xs(n, 1.0);
-    std::vector<double> xp(n, 1.0);
+    amgcl::backend::numa_vector<double> xs(n, true);
+    amgcl::backend::numa_vector<double> xp(n, true);
+
+    std::fill_n(xs.data(), n, 1.0);
+    std::fill_n(xp.data(), n, 1.0);
 
     {
         scoped_tic t(prof, "serial");
