@@ -35,11 +35,11 @@ struct sptr_solver {
     int64_t n, nlev;
 
     std::vector<int64_t> start;
-    std::vector<int64_t> order;
+    amgcl::backend::numa_vector<int64_t> order;
 
-    std::vector<int64_t> ptr;
-    std::vector<int64_t> col;
-    std::vector<double>  val;
+    amgcl::backend::numa_vector<int64_t> ptr;
+    amgcl::backend::numa_vector<int64_t> col;
+    amgcl::backend::numa_vector<double>  val;
 
     const double *D;
 
@@ -50,7 +50,7 @@ struct sptr_solver {
             std::vector<double>  const &_val,
             const double *D = 0
             ) :
-        n(n), nlev(0), order(n, 0), D(D)
+        n(n), nlev(0), order(n, false), D(D)
     {
         std::vector<int64_t> lev(n, 0);
 
@@ -73,22 +73,45 @@ struct sptr_solver {
 
         std::partial_sum(start.begin(), start.end(), start.begin());
 
+        // numa-touch order vector.
+        for(int64_t l = 0; l < nlev; ++l) {
+#pragma omp parallel for
+            for(int64_t r = start[l]; r < start[l+1]; ++r) {
+                order[r] = 0;
+            }
+        }
+
         for(int64_t i = 0; i < n; ++i)
             order[start[lev[i]]++] = i;
 
         std::rotate(start.begin(), start.end() - 1, start.end());
         start[0] = 0;
 
-        ptr.reserve(n+1); ptr.push_back(0);
-        col.reserve(_ptr[n]);
-        val.reserve(_ptr[n]);
+        ptr.resize(n+1, false); ptr[0] = 0;
+        col.resize(_ptr[n], false);
+        val.resize(_ptr[n], false);
 
-        for(auto i : order) {
-            for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
-                col.push_back(_col[j]);
-                val.push_back(_val[j]);
+        for(int64_t l = 0; l < nlev; ++l) {
+#pragma omp parallel for
+            for(int64_t r = start[l]; r < start[l+1]; ++r) {
+                int64_t i = order[r];
+                ptr[r+1] = _ptr[i+1] - _ptr[i];
             }
-            ptr.push_back(col.size());
+        }
+
+        std::partial_sum(ptr.data(), ptr.data() + n + 1, ptr.data());
+
+        for(int64_t l = 0; l < nlev; ++l) {
+#pragma omp parallel for
+            for(int64_t r = start[l]; r < start[l+1]; ++r) {
+                int64_t i = order[r];
+                int64_t h = ptr[r];
+                for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
+                    col[h] = _col[j];
+                    val[h] = _val[j];
+                    ++h;
+                }
+            }
         }
     }
 
