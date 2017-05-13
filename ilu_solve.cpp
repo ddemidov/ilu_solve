@@ -31,16 +31,23 @@ void serial_solve(int64_t n,
 }
 
 //---------------------------------------------------------------------------
+// Solver for sparse triangular systems.
+// Uses level scheduling approach.
+//---------------------------------------------------------------------------
 struct sptr_solver {
     int64_t n, nlev;
 
-    std::vector<int64_t> start;
-    amgcl::backend::numa_vector<int64_t> order;
+    std::vector<int64_t> start; // start of each level in order
+    amgcl::backend::numa_vector<int64_t> order; // rows ordered by levels
 
+    // reordered matrix data:
     amgcl::backend::numa_vector<int64_t> ptr;
     amgcl::backend::numa_vector<int64_t> col;
     amgcl::backend::numa_vector<double>  val;
 
+    // matrix diagonal (stored separately). when null, the diagonal is assumed
+    // to be filled with ones, and the matrix is assumed to be lower
+    // triangular. otherwise matrix is upper triangular.
     const double *D;
 
     sptr_solver(
@@ -54,6 +61,7 @@ struct sptr_solver {
     {
         std::vector<int64_t> lev(n, 0);
 
+        // 1. split rows into levels.
         int64_t beg = D ? n-1 : 0;
         int64_t end = D ?  -1 : n;
         int64_t inc = D ?  -1 : 1;
@@ -68,6 +76,7 @@ struct sptr_solver {
             nlev = std::max(nlev, l+1);
         }
 
+        // 2. reorder matrix rows.
         start.resize(nlev+1, 0);
         for(int64_t i = 0; i < n; ++i) ++start[lev[i]+1];
 
@@ -87,6 +96,7 @@ struct sptr_solver {
         std::rotate(start.begin(), start.end() - 1, start.end());
         start[0] = 0;
 
+        // 3. reorganize matrix data for better cache and NUMA locality.
         ptr.resize(n+1, false); ptr[0] = 0;
         col.resize(_ptr[n], false);
         val.resize(_ptr[n], false);
