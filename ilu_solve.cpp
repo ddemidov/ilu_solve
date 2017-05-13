@@ -121,9 +121,10 @@ struct sptr_solver {
 #pragma omp parallel for
                 for(int64_t r = start[l]; r < start[l+1]; ++r) {
                     int64_t i = order[r];
+                    double X = 0;
                     for(int64_t j = ptr[r], e = ptr[r+1]; j < e; ++j)
-                        x[i] -= val[j] * x[col[j]];
-                    x[i] = D[i] * x[i];
+                        X += val[j] * x[col[j]];
+                    x[i] = D[i] * (x[i] - X);
                 }
             }
         } else {
@@ -131,8 +132,10 @@ struct sptr_solver {
 #pragma omp parallel for
                 for(int64_t r = start[l]; r < start[l+1]; ++r) {
                     int64_t i = order[r];
+                    double X = 0;
                     for(int64_t j = ptr[r], e = ptr[r+1]; j < e; ++j)
-                        x[i] -= val[j] * x[col[j]];
+                        X += val[j] * x[col[j]];
+                    x[i] -= X;
                 }
             }
         }
