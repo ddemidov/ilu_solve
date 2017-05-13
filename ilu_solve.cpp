@@ -37,21 +37,20 @@ struct sptr_solver {
     std::vector<int64_t> start;
     std::vector<int64_t> order;
 
-    std::vector<int64_t> const &ptr;
-    std::vector<int64_t> const &col;
-    std::vector<double>  const &val;
+    std::vector<int64_t> ptr;
+    std::vector<int64_t> col;
+    std::vector<double>  val;
 
     const double *D;
 
     sptr_solver(
             int64_t n,
-            std::vector<int64_t> const &ptr,
-            std::vector<int64_t> const &col,
-            std::vector<double>  const &val,
+            std::vector<int64_t> const &_ptr,
+            std::vector<int64_t> const &_col,
+            std::vector<double>  const &_val,
             const double *D = 0
             ) :
-        n(n), nlev(0), order(n),
-        ptr(ptr), col(col), val(val), D(D)
+        n(n), nlev(0), order(n, 0), D(D)
     {
         std::vector<int64_t> lev(n, 0);
 
@@ -62,8 +61,8 @@ struct sptr_solver {
         for(int64_t i = beg; i != end; i += inc) {
             int64_t l = lev[i];
 
-            for(int64_t j = ptr[i]; j < ptr[i+1]; ++j)
-                l = std::max(l, lev[col[j]]+1);
+            for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j)
+                l = std::max(l, lev[_col[j]]+1);
 
             lev[i] = l;
             nlev = std::max(nlev, l+1);
@@ -79,6 +78,18 @@ struct sptr_solver {
 
         std::rotate(start.begin(), start.end() - 1, start.end());
         start[0] = 0;
+
+        ptr.reserve(n+1); ptr.push_back(0);
+        col.reserve(_ptr[n]);
+        val.reserve(_ptr[n]);
+
+        for(auto i : order) {
+            for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
+                col.push_back(_col[j]);
+                val.push_back(_val[j]);
+            }
+            ptr.push_back(col.size());
+        }
     }
 
     void solve(std::vector<double> &x) const {
@@ -87,7 +98,7 @@ struct sptr_solver {
 #pragma omp parallel for
                 for(int64_t r = start[l]; r < start[l+1]; ++r) {
                     int64_t i = order[r];
-                    for(int64_t j = ptr[i], e = ptr[i+1]; j < e; ++j)
+                    for(int64_t j = ptr[r], e = ptr[r+1]; j < e; ++j)
                         x[i] -= val[j] * x[col[j]];
                     x[i] = D[i] * x[i];
                 }
@@ -97,7 +108,7 @@ struct sptr_solver {
 #pragma omp parallel for
                 for(int64_t r = start[l]; r < start[l+1]; ++r) {
                     int64_t i = order[r];
-                    for(int64_t j = ptr[i], e = ptr[i+1]; j < e; ++j)
+                    for(int64_t j = ptr[r], e = ptr[r+1]; j < e; ++j)
                         x[i] -= val[j] * x[col[j]];
                 }
             }
