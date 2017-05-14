@@ -51,16 +51,10 @@ struct sptr_solver_v1 {
     // triangular. otherwise matrix is upper triangular.
     const double *D;
 
-#ifdef REORDER_MATRICES
     // reordered matrix data:
     amgcl::backend::numa_vector<int64_t> ptr;
     amgcl::backend::numa_vector<int64_t> col;
     amgcl::backend::numa_vector<double>  val;
-#else
-    std::vector<int64_t> const &ptr;
-    std::vector<int64_t> const &col;
-    std::vector<double>  const &val;
-#endif
 
     sptr_solver_v1(
             int64_t n,
@@ -70,9 +64,6 @@ struct sptr_solver_v1 {
             const double *D = 0
             ) :
         n(n), nlev(0), order(n, false), D(D)
-#ifndef REORDER_MATRICES
-        , ptr(_ptr), col(_col), val(_val)
-#endif
     {
         std::vector<int64_t> lev(n, 0);
 
@@ -113,7 +104,6 @@ struct sptr_solver_v1 {
         std::rotate(start.begin(), start.end() - 1, start.end());
         start[0] = 0;
 
-#ifdef REORDER_MATRICES
         // 3. reorganize matrix data for better cache and NUMA locality.
         ptr.resize(n+1, false); ptr[0] = 0;
         col.resize(_ptr[n], false);
@@ -145,7 +135,6 @@ struct sptr_solver_v1 {
                 }
             }
         }
-#endif
     }
 
     void solve(amgcl::backend::numa_vector<double> &x) const {
@@ -156,13 +145,8 @@ struct sptr_solver_v1 {
 #pragma omp parallel for
                 for(int64_t r = lev_beg; r < lev_end; ++r) {
                     int64_t i = order[r];
-#ifdef REORDER_MATRICES
                     int64_t row_beg = ptr[r];
                     int64_t row_end = ptr[r+1];
-#else
-                    int64_t row_beg = ptr[i];
-                    int64_t row_end = ptr[i+1];
-#endif
                     double X = 0;
                     for(int64_t j = row_beg; j < row_end; ++j)
                         X += val[j] * x[col[j]];
@@ -176,13 +160,8 @@ struct sptr_solver_v1 {
 #pragma omp parallel for
                 for(int64_t r = lev_beg; r < lev_end; ++r) {
                     int64_t i = order[r];
-#ifdef REORDER_MATRICES
                     int64_t row_beg = ptr[r];
                     int64_t row_end = ptr[r+1];
-#else
-                    int64_t row_beg = ptr[i];
-                    int64_t row_end = ptr[i+1];
-#endif
                     double X = 0;
                     for(int64_t j = row_beg; j < row_end; ++j)
                         X += val[j] * x[col[j]];
