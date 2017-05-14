@@ -40,7 +40,7 @@ void serial_solve(int64_t n,
 // Solver for sparse triangular systems.
 // Uses level scheduling approach.
 //---------------------------------------------------------------------------
-struct sptr_solver {
+struct sptr_solver_v1 {
     int64_t n, nlev;
 
     std::vector<int64_t> start; // start of each level in order
@@ -62,7 +62,7 @@ struct sptr_solver {
     std::vector<double>  const &val;
 #endif
 
-    sptr_solver(
+    sptr_solver_v1(
             int64_t n,
             std::vector<int64_t> const &_ptr,
             std::vector<int64_t> const &_col,
@@ -194,11 +194,12 @@ struct sptr_solver {
 };
 
 //---------------------------------------------------------------------------
+template <class SPTR_Solver>
 class ilu_solver {
     private:
         int64_t n;
         std::vector<double>  const &D;
-        sptr_solver L, U;
+        SPTR_Solver L, U;
 
     public:
         ilu_solver(
@@ -277,39 +278,39 @@ int main(int argc, char *argv[]) {
 
     {
         scoped_tic t(prof, "read");
-        amgcl::io::read_dense(vm["D"].as<std::string>(), n, m, D);
-        amgcl::io::read_crs  (vm["L"].as<std::string>(), n, Lptr, Lcol, Lval);
-        amgcl::io::read_crs  (vm["U"].as<std::string>(), n, Uptr, Ucol, Uval);
+        io::read_dense(vm["D"].as<std::string>(), n, m, D);
+        io::read_crs  (vm["L"].as<std::string>(), n, Lptr, Lcol, Lval);
+        io::read_crs  (vm["U"].as<std::string>(), n, Uptr, Ucol, Uval);
     }
 
     amgcl::backend::numa_vector<double> xs(n, true);
-    amgcl::backend::numa_vector<double> xp(n, true);
+    amgcl::backend::numa_vector<double> x1(n, true);
 
     std::fill_n(xs.data(), n, 1.0);
-    std::fill_n(xp.data(), n, 1.0);
+    std::fill_n(x1.data(), n, 1.0);
 
     const int niters = vm["iters"].as<int>();
 
     {
-        scoped_tic t(prof, "serial");
+        scoped_tic t(prof, "serial solve");
         for(int i = 0; i < niters; ++i)
             serial_solve(n, Lptr, Lcol, Lval, Uptr, Ucol, Uval, D, xs);
     }
 
     {
-        scoped_tic t1(prof, "parallel");
-        ilu_solver S(n, Lptr, Lcol, Lval, Uptr, Ucol, Uval, D);
+        scoped_tic t1(prof, "parallel (level scheduling)");
+
+        prof.tic("setup");
+        ilu_solver<sptr_solver_v1> S(n, Lptr, Lcol, Lval, Uptr, Ucol, Uval, D);
+        prof.toc("setup");
 
         scoped_tic t2(prof, "solve");
         for(int i = 0; i < niters; ++i)
-            S.solve(xp);
+            S.solve(x1);
     }
 
-    double delta = 0;
-    for(int64_t i = 0; i < n; ++i)
-        delta += (xs[i] - xp[i]) * (xs[i] - xp[i]);
-
-    std::cout << "delta: " << delta << std::endl;
+    axpby(1, xs, -1, x1);
+    std::cout << "delta (v1): " << inner_product(x1, x1) << std::endl;
 
     std::cout << prof << std::endl;
 }
