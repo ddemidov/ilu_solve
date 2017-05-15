@@ -52,6 +52,7 @@ void serial_solve(int64_t n,
 // Solver for sparse triangular systems.
 // Uses level scheduling approach.
 //---------------------------------------------------------------------------
+template <bool lower = true>
 struct sptr_solver_v1 {
     int64_t n, nlev;
 
@@ -81,9 +82,9 @@ struct sptr_solver_v1 {
 
         // 1. split rows into levels.
         prof.tic("color");
-        int64_t beg = D ? n-1 : 0;
-        int64_t end = D ?  -1 : n;
-        int64_t inc = D ?  -1 : 1;
+        int64_t beg = lower ? 0 : n-1;
+        int64_t end = lower ? n :  -1;
+        int64_t inc = lower ? 1 :  -1;
 
         for(int64_t i = beg; i != end; i += inc) {
             int64_t l = lev[i];
@@ -154,35 +155,22 @@ struct sptr_solver_v1 {
     }
 
     void solve(amgcl::backend::numa_vector<double> &x) const {
-        if (D) {
-            for(int64_t l = 0; l < nlev; ++l) {
-                int64_t lev_beg = start[l];
-                int64_t lev_end = start[l+1];
+        for(int64_t l = 0; l < nlev; ++l) {
+            int64_t lev_beg = start[l];
+            int64_t lev_end = start[l+1];
 #pragma omp parallel for
-                for(int64_t r = lev_beg; r < lev_end; ++r) {
-                    int64_t i = order[r];
-                    int64_t row_beg = ptr[r];
-                    int64_t row_end = ptr[r+1];
-                    double X = 0;
-                    for(int64_t j = row_beg; j < row_end; ++j)
-                        X += val[j] * x[col[j]];
-                    x[i] = D[i] * (x[i] - X);
-                }
-            }
-        } else {
-            for(int64_t l = 0; l < nlev; ++l) {
-                int64_t lev_beg = start[l];
-                int64_t lev_end = start[l+1];
-#pragma omp parallel for
-                for(int64_t r = lev_beg; r < lev_end; ++r) {
-                    int64_t i = order[r];
-                    int64_t row_beg = ptr[r];
-                    int64_t row_end = ptr[r+1];
-                    double X = 0;
-                    for(int64_t j = row_beg; j < row_end; ++j)
-                        X += val[j] * x[col[j]];
+            for(int64_t r = lev_beg; r < lev_end; ++r) {
+                int64_t i = order[r];
+                int64_t row_beg = ptr[r];
+                int64_t row_end = ptr[r+1];
+                double X = 0;
+                for(int64_t j = row_beg; j < row_end; ++j)
+                    X += val[j] * x[col[j]];
+
+                if (lower)
                     x[i] -= X;
-                }
+                else
+                    x[i] = D[i] * (x[i] - X);
             }
         }
     }
@@ -196,6 +184,7 @@ struct sptr_solver_v1 {
 //     shared-memory sparse triangular solver." International Supercomputing
 //     Conference. Springer International Publishing, 2014.
 //---------------------------------------------------------------------------
+template <bool lower>
 struct sptr_solver_v2 {
     struct task {
         int thread_id;
@@ -214,13 +203,12 @@ struct sptr_solver_v2 {
 
     int64_t n, nlev;
 
-    std::vector<int64_t> start; // start of each level in order
     amgcl::backend::numa_vector<int64_t> order; // rows ordered by levels
 
     // matrix diagonal (stored separately). when null, the diagonal is assumed
     // to be filled with ones, and the matrix is assumed to be lower
     // triangular. otherwise matrix is upper triangular.
-    const double *D;
+    amgcl::backend::numa_vector<double> D;
 
     // reordered matrix data:
     amgcl::backend::numa_vector<int64_t> ptr;
@@ -232,17 +220,17 @@ struct sptr_solver_v2 {
             std::vector<int64_t> const &_ptr,
             std::vector<int64_t> const &_col,
             std::vector<double>  const &_val,
-            const double *D = 0
+            const double *_D = 0
             ) :
-        n(n), nlev(0), order(n, false), D(D)
+        n(n), nlev(0), order(n, false)
     {
         std::vector<int64_t> lev(n, 0);
 
         // 1. split rows into levels.
         prof.tic("color");
-        int64_t beg = D ? n-1 : 0;
-        int64_t end = D ?  -1 : n;
-        int64_t inc = D ?  -1 : 1;
+        int64_t beg = lower ? 0 : n-1;
+        int64_t end = lower ? n :  -1;
+        int64_t inc = lower ? 1 :  -1;
 
         for(int64_t i = beg; i != end; i += inc) {
             int64_t l = lev[i];
@@ -257,7 +245,7 @@ struct sptr_solver_v2 {
 
         // 2. reorder matrix rows.
         prof.tic("sort");
-        start.resize(nlev+1, 0);
+        std::vector<int64_t> start(nlev+1, 0); // start of each level in ordered rows
         for(int64_t i = 0; i < n; ++i) ++start[lev[i]+1];
 
         // numa-touch order vector.
@@ -280,16 +268,19 @@ struct sptr_solver_v2 {
         // 3.1 Organize matrix rows into tasks.
         //    Each level is split into nthreads tasks.
         prof.tic("schedule");
-#ifdef _OPENMP
-        int nthreads = omp_get_max_threads();
-#else
-        int nthreads = 1;
-#endif
+        int nthreads = num_threads();
         std::vector<int64_t> task_id(n);
 
         {
             scoped_tic tic(prof, "split levels into tasks");
             thread_tasks.resize(nthreads);
+#pragma omp parallel
+            {
+                int tid = thread_id();
+                thread_tasks[tid].resize(nlev);
+                thread_tasks[tid].resize(0);
+            }
+
             for(int64_t lev = 0; lev < nlev; ++lev) {
                 // split each level into tasks.
                 int64_t lev_size = start[lev+1] - start[lev];
@@ -320,13 +311,11 @@ struct sptr_solver_v2 {
         col.resize(_ptr[n], false);
         val.resize(_ptr[n], false);
 
+        if (!lower) D.resize(n, false);
+
 #pragma omp parallel
         {
-#ifdef _OPENMP
-            int tid = omp_get_thread_num();
-#else
-            int tid = 0;
-#endif
+            int tid = thread_id();
             for(int t : thread_tasks[tid]) {
                 int64_t beg = tasks[t].row_beg;
                 int64_t end = tasks[t].row_end;
@@ -334,6 +323,7 @@ struct sptr_solver_v2 {
                 for(int64_t r = beg; r < end; ++r) {
                     int64_t i = order[r];
                     ptr[r+1] = _ptr[i+1] - _ptr[i];
+                    if (!lower) D[r] = _D[i];
                 }
             }
         }
@@ -342,11 +332,7 @@ struct sptr_solver_v2 {
 
 #pragma omp parallel
         {
-#ifdef _OPENMP
-            int tid = omp_get_thread_num();
-#else
-            int tid = 0;
-#endif
+            int tid = thread_id();
             for(int t : thread_tasks[tid]) {
                 int64_t beg = tasks[t].row_beg;
                 int64_t end = tasks[t].row_end;
@@ -416,9 +402,13 @@ struct sptr_solver_v2 {
             }
         }
 
-        for(size_t i = 0; i < tasks.size(); ++i) {
-            tasks[i].children.assign(child[i].begin(), child[i].end());
-            depends[i] = parent[i].size();
+#pragma omp parallel
+        {
+            int tid = thread_id();
+            for(int t : thread_tasks[tid]) {
+                tasks[t].children.assign(child[t].begin(), child[t].end());
+                depends[t] = parent[t].size();
+            }
         }
         prof.toc("schedule");
 
@@ -431,11 +421,7 @@ struct sptr_solver_v2 {
 
 #pragma omp parallel
         {
-#ifdef _OPENMP
-            int tid = omp_get_thread_num();
-#else
-            int tid = 0;
-#endif
+            int tid = thread_id();
             for(auto t : thread_tasks[tid]) {
                 // busy wait for parents to finish:
                 while(deps[t] > 0);
@@ -451,10 +437,10 @@ struct sptr_solver_v2 {
                     double X = 0;
                     for(int64_t j = row_beg; j < row_end; ++j)
                         X += val[j] * x[col[j]];
-                    if (D)
-                        x[i] = D[i] * (x[i] - X);
-                    else
+                    if (lower)
                         x[i] -= X;
+                    else
+                        x[i] = D[r] * (x[i] - X);
                 }
 
                 // notify children they are free to go
@@ -463,15 +449,32 @@ struct sptr_solver_v2 {
             }
         }
     }
+
+    static int num_threads() {
+#ifdef _OPENMP
+        return omp_get_max_threads();
+#else
+        return 1;
+#endif
+    }
+
+    static int thread_id() {
+#ifdef _OPENMP
+        return omp_get_thread_num();
+#else
+        return 0;
+#endif
+    }
 };
 
 //---------------------------------------------------------------------------
-template <class SPTR_Solver>
+template <template <bool> class SPTR_Solver>
 class ilu_solver {
     private:
         int64_t n;
         std::vector<double>  const &D;
-        SPTR_Solver L, U;
+        SPTR_Solver<true>  L;
+        SPTR_Solver<false> U;
 
     public:
         ilu_solver(
