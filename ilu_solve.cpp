@@ -466,6 +466,208 @@ struct sptr_solver_v2 {
     }
 };
 
+template <bool lower>
+struct sptr_solver_v3 {
+    struct task {
+        int thread_id;
+        int64_t row_beg, row_end, loc_beg;
+
+        task(int id, int64_t beg, int64_t end)
+            : thread_id(id), row_beg(beg), row_end(end)
+        {}
+    };
+
+    std::vector<task> tasks;
+    std::vector< std::vector<int> > thread_tasks;
+
+    int64_t n, nlev;
+
+    amgcl::backend::numa_vector<int64_t> order; // rows ordered by levels
+
+    // reordered matrix data:
+    std::vector< std::vector<int64_t> > ptr;
+    std::vector< std::vector<int64_t> > col;
+    std::vector< std::vector<double>  > val;
+    std::vector< std::vector<double>  > D;
+
+    sptr_solver_v3(
+            int64_t n,
+            std::vector<int64_t> const &_ptr,
+            std::vector<int64_t> const &_col,
+            std::vector<double>  const &_val,
+            const double *_D = 0
+            ) :
+        n(n), nlev(0), order(n, false)
+    {
+        std::vector<int64_t> lev(n, 0);
+
+        // 1. split rows into levels.
+        prof.tic("color");
+        int64_t beg = lower ? 0 : n-1;
+        int64_t end = lower ? n :  -1;
+        int64_t inc = lower ? 1 :  -1;
+
+        for(int64_t i = beg; i != end; i += inc) {
+            int64_t l = lev[i];
+
+            for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j)
+                l = std::max(l, lev[_col[j]]+1);
+
+            lev[i] = l;
+            nlev = std::max(nlev, l+1);
+        }
+        prof.toc("color");
+
+        // 2. reorder matrix rows.
+        prof.tic("sort");
+        std::vector<int64_t> start(nlev+1, 0); // start of each level in ordered rows
+        for(int64_t i = 0; i < n; ++i) ++start[lev[i]+1];
+
+        // numa-touch order vector.
+        for(int64_t l = 0; l < nlev; ++l) {
+            int64_t lev_beg = start[l];
+            int64_t lev_end = start[l+1] = lev_beg + start[l+1];
+#pragma omp parallel for
+            for(int64_t r = lev_beg; r < lev_end; ++r) {
+                order[r] = 0;
+            }
+        }
+
+        for(int64_t i = 0; i < n; ++i)
+            order[start[lev[i]]++] = i;
+
+        std::rotate(start.begin(), start.end() - 1, start.end());
+        start[0] = 0;
+        prof.toc("sort");
+
+        // 3.1 Organize matrix rows into tasks.
+        //    Each level is split into nthreads tasks.
+        int nthreads = num_threads();
+        std::vector<int64_t> thread_rows(nthreads, 0);
+        std::vector<int64_t> thread_cols(nthreads, 0);
+        std::vector<int64_t> task_id(n);
+
+        {
+            scoped_tic tic(prof, "split levels into tasks");
+            thread_tasks.resize(nthreads);
+#pragma omp parallel
+            {
+                int tid = thread_id();
+                thread_tasks[tid].resize(nlev);
+                thread_tasks[tid].resize(0);
+            }
+
+            for(int64_t lev = 0; lev < nlev; ++lev) {
+                // split each level into tasks.
+                int64_t lev_size = start[lev+1] - start[lev];
+                int64_t chunk_size = (lev_size + nthreads - 1) / nthreads;
+
+                for(int tid = 0; tid < nthreads; ++tid) {
+                    int64_t beg = std::min(tid * chunk_size, lev_size);
+                    int64_t end = std::min(beg + chunk_size, lev_size);
+
+                    beg += start[lev];
+                    end += start[lev];
+
+                    thread_rows[tid] += end - beg;
+
+                    int64_t this_task = tasks.size();
+                    thread_tasks[tid].push_back(this_task);
+                    tasks.push_back(task(tid, beg, end));
+
+                    // mark rows that belong to the current task
+                    for(int64_t i = beg; i < end; ++i) {
+                        int64_t j = order[i];
+                        task_id[j] = this_task;
+                        thread_cols[tid] += _ptr[j+1] - _ptr[j];
+                    }
+                }
+            }
+        }
+
+        // 4. reorganize matrix data for better cache and NUMA locality.
+        prof.tic("reorder matrix");
+        ptr.resize(nthreads);
+        col.resize(nthreads);
+        val.resize(nthreads);
+        if (!lower) D.resize(nthreads);
+
+#pragma omp parallel
+        {
+            int tid = thread_id();
+            ptr[tid].reserve(thread_rows[tid] + 1);
+            col[tid].reserve(thread_cols[tid]);
+            val[tid].reserve(thread_cols[tid]);
+            ptr[tid].push_back(0);
+
+            if (!lower) D[tid].reserve(thread_rows[tid]);
+
+            for(int t : thread_tasks[tid]) {
+                int64_t beg = tasks[t].row_beg;
+                int64_t end = tasks[t].row_end;
+
+                tasks[t].loc_beg = ptr[tid].size() - 1;
+
+                for(int64_t r = beg; r < end; ++r) {
+                    int64_t i = order[r];
+                    if (!lower) D[tid].push_back(_D[i]);
+                    for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
+                        col[tid].push_back(_col[j]);
+                        val[tid].push_back(_val[j]);
+                    }
+                    ptr[tid].push_back(col[tid].size());
+                }
+            }
+        }
+        prof.toc("reorder matrix");
+    }
+
+    void solve(amgcl::backend::numa_vector<double> &x) const {
+#pragma omp parallel
+        {
+            int tid = thread_id();
+            for(auto t : thread_tasks[tid]) {
+                // each task corresponds to a level, so do barrier
+                // synchronization at the end of it
+                int64_t beg = tasks[t].row_beg;
+                int64_t end = tasks[t].row_end;
+
+                for(int64_t r = beg, k = tasks[t].loc_beg; r < end; ++r, ++k) {
+                    int64_t i = order[r];
+                    int64_t row_beg = ptr[tid][k];
+                    int64_t row_end = ptr[tid][k+1];
+                    double X = 0;
+                    for(int64_t j = row_beg; j < row_end; ++j) {
+                        X += val[tid][j] * x[col[tid][j]];
+                    }
+                    if (lower)
+                        x[i] -= X;
+                    else
+                        x[i] = D[tid][k] * (x[i] - X);
+                }
+
+#pragma omp barrier
+            }
+        }
+    }
+
+    static int num_threads() {
+#ifdef _OPENMP
+        return omp_get_max_threads();
+#else
+        return 1;
+#endif
+    }
+
+    static int thread_id() {
+#ifdef _OPENMP
+        return omp_get_thread_num();
+#else
+        return 0;
+#endif
+    }
+};
+
 //---------------------------------------------------------------------------
 template <template <bool> class SPTR_Solver>
 class ilu_solver {
@@ -560,10 +762,12 @@ int main(int argc, char *argv[]) {
     amgcl::backend::numa_vector<double> xs(n, true);
     amgcl::backend::numa_vector<double> x1(n, true);
     amgcl::backend::numa_vector<double> x2(n, true);
+    amgcl::backend::numa_vector<double> x3(n, true);
 
     std::fill_n(xs.data(), n, 1.0);
     std::fill_n(x1.data(), n, 1.0);
     std::fill_n(x2.data(), n, 1.0);
+    std::fill_n(x3.data(), n, 1.0);
 
     const int niters = vm["iters"].as<int>();
 
@@ -600,11 +804,26 @@ int main(int argc, char *argv[]) {
             S.solve(x2);
     }
 
+    {
+        std::cout << "parallel (v3)..." << std::endl;
+        scoped_tic t1(prof, "parallel (v3)");
+
+        prof.tic("setup");
+        ilu_solver<sptr_solver_v3> S(n, Lptr, Lcol, Lval, Uptr, Ucol, Uval, D);
+        prof.toc("setup");
+
+        scoped_tic t2(prof, "solve");
+        for(int i = 0; i < niters; ++i)
+            S.solve(x3);
+    }
+
     axpby(1, xs, -1, x1);
     axpby(1, xs, -1, x2);
+    axpby(1, xs, -1, x3);
 
     std::cout << "delta (v1): " << inner_product(x1, x1) << std::endl;
     std::cout << "delta (v2): " << inner_product(x2, x2) << std::endl;
+    std::cout << "delta (v3): " << inner_product(x3, x3) << std::endl;
 
     std::cout << prof << std::endl;
 }
