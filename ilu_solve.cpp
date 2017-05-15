@@ -277,43 +277,9 @@ struct sptr_solver_v2 {
         start[0] = 0;
         prof.toc("sort");
 
-        // 3. reorganize matrix data for better cache and NUMA locality.
-        prof.tic("reorder matrix");
-        ptr.resize(n+1, false); ptr[0] = 0;
-        col.resize(_ptr[n], false);
-        val.resize(_ptr[n], false);
-
-        for(int64_t l = 0; l < nlev; ++l) {
-            int64_t lev_beg = start[l];
-            int64_t lev_end = start[l+1];
-#pragma omp parallel for
-            for(int64_t r = lev_beg; r < lev_end; ++r) {
-                int64_t i = order[r];
-                ptr[r+1] = _ptr[i+1] - _ptr[i];
-            }
-        }
-
-        std::partial_sum(ptr.data(), ptr.data() + n + 1, ptr.data());
-
-        for(int64_t l = 0; l < nlev; ++l) {
-            int64_t lev_beg = start[l];
-            int64_t lev_end = start[l+1];
-#pragma omp parallel for
-            for(int64_t r = lev_beg; r < lev_end; ++r) {
-                int64_t i = order[r];
-                int64_t h = ptr[r];
-                for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
-                    col[h] = _col[j];
-                    val[h] = _val[j];
-                    ++h;
-                }
-            }
-        }
-        prof.toc("reorder matrix");
-
-        prof.tic("schedule");
-        // 4. Organize matrix rows into tasks.
+        // 3.1 Organize matrix rows into tasks.
         //    Each level is split into nthreads tasks.
+        prof.tic("schedule");
 #ifdef _OPENMP
         int nthreads = omp_get_max_threads();
 #else
@@ -346,8 +312,60 @@ struct sptr_solver_v2 {
                 }
             }
         }
+        prof.toc("schedule");
 
-        // Build task dependency graphs (both directions).
+        // 4. reorganize matrix data for better cache and NUMA locality.
+        prof.tic("reorder matrix");
+        ptr.resize(n+1, false); ptr[0] = 0;
+        col.resize(_ptr[n], false);
+        val.resize(_ptr[n], false);
+
+#pragma omp parallel
+        {
+#ifdef _OPENMP
+            int tid = omp_get_thread_num();
+#else
+            int tid = 0;
+#endif
+            for(int t : thread_tasks[tid]) {
+                int64_t beg = tasks[t].row_beg;
+                int64_t end = tasks[t].row_end;
+
+                for(int64_t r = beg; r < end; ++r) {
+                    int64_t i = order[r];
+                    ptr[r+1] = _ptr[i+1] - _ptr[i];
+                }
+            }
+        }
+
+        std::partial_sum(ptr.data(), ptr.data() + n + 1, ptr.data());
+
+#pragma omp parallel
+        {
+#ifdef _OPENMP
+            int tid = omp_get_thread_num();
+#else
+            int tid = 0;
+#endif
+            for(int t : thread_tasks[tid]) {
+                int64_t beg = tasks[t].row_beg;
+                int64_t end = tasks[t].row_end;
+
+                for(int64_t r = beg; r < end; ++r) {
+                    int64_t i = order[r];
+                    int64_t h = ptr[r];
+                    for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
+                        col[h] = _col[j];
+                        val[h] = _val[j];
+                        ++h;
+                    }
+                }
+            }
+        }
+        prof.toc("reorder matrix");
+
+        // 3.2. Build task dependency graphs (both directions).
+        prof.tic("schedule");
         std::vector< std::set<int64_t> > parent(tasks.size());
         std::vector< std::set<int64_t> > child(tasks.size());
         {
@@ -403,6 +421,7 @@ struct sptr_solver_v2 {
             depends[i] = parent[i].size();
         }
         prof.toc("schedule");
+
     }
 
     void solve(amgcl::backend::numa_vector<double> &x) const {
