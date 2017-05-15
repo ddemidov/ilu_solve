@@ -321,64 +321,73 @@ struct sptr_solver_v2 {
 #endif
         std::vector<int64_t> task_id(n);
 
-        thread_tasks.resize(nthreads);
-        for(int64_t lev = 0; lev < nlev; ++lev) {
-            // split each level into tasks.
-            int64_t lev_size = start[lev+1] - start[lev];
-            int64_t chunk_size = (lev_size + nthreads - 1) / nthreads;
+        {
+            scoped_tic tic(prof, "split levels into tasks");
+            thread_tasks.resize(nthreads);
+            for(int64_t lev = 0; lev < nlev; ++lev) {
+                // split each level into tasks.
+                int64_t lev_size = start[lev+1] - start[lev];
+                int64_t chunk_size = (lev_size + nthreads - 1) / nthreads;
 
-            for(int tid = 0; tid < nthreads; ++tid) {
-                int64_t beg = tid * chunk_size;
-                int64_t end = std::min(beg + chunk_size, lev_size);
+                for(int tid = 0; tid < nthreads; ++tid) {
+                    int64_t beg = tid * chunk_size;
+                    int64_t end = std::min(beg + chunk_size, lev_size);
 
-                beg += start[lev];
-                end += start[lev];
+                    beg += start[lev];
+                    end += start[lev];
 
-                int64_t this_task = tasks.size();
-                thread_tasks[tid].push_back(this_task);
-                tasks.push_back(task(tid, beg, end));
+                    int64_t this_task = tasks.size();
+                    thread_tasks[tid].push_back(this_task);
+                    tasks.push_back(task(tid, beg, end));
 
-                // mark rows that belong to the current task
-                for(int64_t i = beg; i < end; ++i)
-                    task_id[order[i]] = this_task;
+                    // mark rows that belong to the current task
+                    for(int64_t i = beg; i < end; ++i)
+                        task_id[order[i]] = this_task;
+                }
             }
         }
-
-        depends.resize(tasks.size());
-        std::vector<std::atomic<int>>(tasks.size()).swap(deps);
 
         // Build task dependency graphs (both directions).
         std::vector< std::set<int64_t> > parent(tasks.size());
         std::vector< std::set<int64_t> > child(tasks.size());
 
-        for(int64_t i = 0; i < n; ++i) {
-            int64_t task_i = task_id[i];
-            for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
-                int64_t task_j = task_id[_col[j]];
+        {
+            scoped_tic tic(prof, "build TDG");
+            depends.resize(tasks.size());
+            std::vector<std::atomic<int>>(tasks.size()).swap(deps);
 
-                // task_i is parent of task_j:
-                parent[task_i].insert(task_j);
-                child[task_j].insert(task_i);
-            }
-        }
+            for(int64_t i = 0; i < n; ++i) {
+                int64_t task_i = task_id[i];
+                for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
+                    int64_t task_j = task_id[_col[j]];
 
-        for(size_t i = 0; i < tasks.size(); ++i) {
-            for(auto k : child[i]) {
-                for(auto j : parent[k]) {
-                    if (child[i].count(j)) {
-                        child[i].erase(k);
-                        parent[k].erase(i);
-                        break;
-                    }
+                    // task_i is parent of task_j:
+                    parent[task_i].insert(task_j);
+                    child[task_j].insert(task_i);
                 }
             }
         }
 
-        for(size_t i = 0; i < tasks.size(); ++i) {
-            for(auto j : child[i]) {
-                if (tasks[i].thread_id == tasks[j].thread_id) {
-                    child[i].erase(j);
-                    parent[j].erase(i);
+        {
+            scoped_tic tic(prof, "sparsify TDG");
+            for(size_t i = 0; i < tasks.size(); ++i) {
+                for(auto k : child[i]) {
+                    for(auto j : parent[k]) {
+                        if (child[i].count(j)) {
+                            child[i].erase(k);
+                            parent[k].erase(i);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            for(size_t i = 0; i < tasks.size(); ++i) {
+                for(auto j : child[i]) {
+                    if (tasks[i].thread_id == tasks[j].thread_id) {
+                        child[i].erase(j);
+                        parent[j].erase(i);
+                    }
                 }
             }
         }
@@ -391,6 +400,7 @@ struct sptr_solver_v2 {
     }
 
     void solve(amgcl::backend::numa_vector<double> &x) const {
+#pragma omp parallel for
         for(size_t i = 0; i < tasks.size(); ++i)
             deps[i] = depends[i];
 
