@@ -350,20 +350,26 @@ struct sptr_solver_v2 {
         // Build task dependency graphs (both directions).
         std::vector< std::set<int64_t> > parent(tasks.size());
         std::vector< std::set<int64_t> > child(tasks.size());
-
         {
             scoped_tic tic(prof, "build TDG");
             depends.resize(tasks.size());
             std::vector<std::atomic<int>>(tasks.size()).swap(deps);
 
-            for(int64_t i = 0; i < n; ++i) {
-                int64_t task_i = task_id[i];
-                for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
-                    int64_t task_j = task_id[_col[j]];
+            std::vector<int64_t> marker(tasks.size(), -1);
 
-                    // task_i is parent of task_j:
-                    parent[task_i].insert(task_j);
-                    child[task_j].insert(task_i);
+            for(int64_t r = 0; r < n; ++r) {
+                int64_t i = order[r];
+                int64_t task_i = task_id[i];
+
+                for(int64_t j = ptr[r]; j < ptr[r+1]; ++j) {
+                    int64_t task_j = task_id[col[j]];
+
+                    if (marker[task_j] < task_i) {
+                        marker[task_j] = task_i;
+                        // task_i is parent of task_j:
+                        parent[task_i].insert(task_j);
+                        child[task_j].insert(task_i);
+                    }
                 }
             }
         }
