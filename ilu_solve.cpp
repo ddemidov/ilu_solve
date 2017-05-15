@@ -344,6 +344,9 @@ struct sptr_solver_v2 {
             }
         }
 
+        depends.resize(tasks.size());
+        std::vector<std::atomic<int>>(tasks.size()).swap(deps);
+
         // Build task dependency graphs (both directions).
         std::vector< std::set<int64_t> > parent(tasks.size());
         std::vector< std::set<int64_t> > child(tasks.size());
@@ -359,8 +362,26 @@ struct sptr_solver_v2 {
             }
         }
 
-        depends.resize(tasks.size());
-        std::vector<std::atomic<int>>(tasks.size()).swap(deps);
+        for(size_t i = 0; i < tasks.size(); ++i) {
+            for(auto k : child[i]) {
+                for(auto j : parent[k]) {
+                    if (child[i].count(j)) {
+                        child[i].erase(k);
+                        parent[k].erase(i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for(size_t i = 0; i < tasks.size(); ++i) {
+            for(auto j : child[i]) {
+                if (tasks[i].thread_id == tasks[j].thread_id) {
+                    child[i].erase(j);
+                    parent[j].erase(i);
+                }
+            }
+        }
 
         for(size_t i = 0; i < tasks.size(); ++i) {
             tasks[i].children.assign(child[i].begin(), child[i].end());
