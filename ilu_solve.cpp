@@ -188,7 +188,7 @@ template <bool lower>
 struct sptr_solver_v2 {
     struct task {
         int thread_id;
-        int64_t row_beg, row_end;
+        int64_t row_beg, row_end, loc_beg;
         std::vector<int> children;
 
         task(int id, int64_t beg, int64_t end)
@@ -205,15 +205,11 @@ struct sptr_solver_v2 {
 
     amgcl::backend::numa_vector<int64_t> order; // rows ordered by levels
 
-    // matrix diagonal (stored separately). when null, the diagonal is assumed
-    // to be filled with ones, and the matrix is assumed to be lower
-    // triangular. otherwise matrix is upper triangular.
-    amgcl::backend::numa_vector<double> D;
-
     // reordered matrix data:
-    amgcl::backend::numa_vector<int64_t> ptr;
-    amgcl::backend::numa_vector<int64_t> col;
-    amgcl::backend::numa_vector<double>  val;
+    std::vector< std::vector<int64_t> > ptr;
+    std::vector< std::vector<int64_t> > col;
+    std::vector< std::vector<double>  > val;
+    std::vector< std::vector<double>  > D;
 
     sptr_solver_v2(
             int64_t n,
@@ -269,6 +265,8 @@ struct sptr_solver_v2 {
         //    Each level is split into nthreads tasks.
         prof.tic("schedule");
         int nthreads = num_threads();
+        std::vector<int64_t> thread_rows(nthreads, 0);
+        std::vector<int64_t> thread_cols(nthreads, 0);
         std::vector<int64_t> task_id(n);
 
         {
@@ -287,19 +285,24 @@ struct sptr_solver_v2 {
                 int64_t chunk_size = (lev_size + nthreads - 1) / nthreads;
 
                 for(int tid = 0; tid < nthreads; ++tid) {
-                    int64_t beg = tid * chunk_size;
+                    int64_t beg = std::min(tid * chunk_size, lev_size);
                     int64_t end = std::min(beg + chunk_size, lev_size);
 
                     beg += start[lev];
                     end += start[lev];
+
+                    thread_rows[tid] += end - beg;
 
                     int64_t this_task = tasks.size();
                     thread_tasks[tid].push_back(this_task);
                     tasks.push_back(task(tid, beg, end));
 
                     // mark rows that belong to the current task
-                    for(int64_t i = beg; i < end; ++i)
-                        task_id[order[i]] = this_task;
+                    for(int64_t i = beg; i < end; ++i) {
+                        int64_t j = order[i];
+                        task_id[j] = this_task;
+                        thread_cols[tid] += _ptr[j+1] - _ptr[j];
+                    }
                 }
             }
         }
@@ -307,44 +310,35 @@ struct sptr_solver_v2 {
 
         // 4. reorganize matrix data for better cache and NUMA locality.
         prof.tic("reorder matrix");
-        ptr.resize(n+1, false); ptr[0] = 0;
-        col.resize(_ptr[n], false);
-        val.resize(_ptr[n], false);
-
-        if (!lower) D.resize(n, false);
-
-#pragma omp parallel
-        {
-            int tid = thread_id();
-            for(int t : thread_tasks[tid]) {
-                int64_t beg = tasks[t].row_beg;
-                int64_t end = tasks[t].row_end;
-
-                for(int64_t r = beg; r < end; ++r) {
-                    int64_t i = order[r];
-                    ptr[r+1] = _ptr[i+1] - _ptr[i];
-                    if (!lower) D[r] = _D[i];
-                }
-            }
-        }
-
-        std::partial_sum(ptr.data(), ptr.data() + n + 1, ptr.data());
+        ptr.resize(nthreads);
+        col.resize(nthreads);
+        val.resize(nthreads);
+        if (!lower) D.resize(nthreads);
 
 #pragma omp parallel
         {
             int tid = thread_id();
+            ptr[tid].reserve(thread_rows[tid] + 1);
+            col[tid].reserve(thread_cols[tid]);
+            val[tid].reserve(thread_cols[tid]);
+            ptr[tid].push_back(0);
+
+            if (!lower) D[tid].reserve(thread_rows[tid]);
+
             for(int t : thread_tasks[tid]) {
                 int64_t beg = tasks[t].row_beg;
                 int64_t end = tasks[t].row_end;
 
+                tasks[t].loc_beg = ptr[tid].size() - 1;
+
                 for(int64_t r = beg; r < end; ++r) {
                     int64_t i = order[r];
-                    int64_t h = ptr[r];
+                    if (!lower) D[tid].push_back(_D[i]);
                     for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j) {
-                        col[h] = _col[j];
-                        val[h] = _val[j];
-                        ++h;
+                        col[tid].push_back(_col[j]);
+                        val[tid].push_back(_val[j]);
                     }
+                    ptr[tid].push_back(col[tid].size());
                 }
             }
         }
@@ -359,20 +353,24 @@ struct sptr_solver_v2 {
             depends.resize(tasks.size());
             std::vector<std::atomic<int>>(tasks.size()).swap(deps);
 
-            std::vector<int64_t> marker(tasks.size(), -1);
+            std::vector<size_t> marker(tasks.size(), -1);
 
-            for(int64_t r = 0; r < n; ++r) {
-                int64_t i = order[r];
-                int64_t task_i = task_id[i];
+            for(size_t i = 0; i < tasks.size(); ++i) {
+                int64_t t_id = tasks[i].thread_id;
+                int64_t gbeg = tasks[i].row_beg;
+                int64_t gend = tasks[i].row_end;
+                int64_t lbeg = tasks[i].loc_beg;
 
-                for(int64_t j = ptr[r]; j < ptr[r+1]; ++j) {
-                    int64_t task_j = task_id[col[j]];
+                for(int64_t r = gbeg, k = lbeg; r < gend; ++r, ++k) {
+                    for(int64_t j = ptr[t_id][k]; j < ptr[t_id][k+1]; ++j) {
+                        int64_t task_j = task_id[col[t_id][j]];
 
-                    if (marker[task_j] < task_i) {
-                        marker[task_j] = task_i;
-                        // task_i is parent of task_j:
-                        parent[task_i].insert(task_j);
-                        child[task_j].insert(task_i);
+                        if (marker[task_j] != i) {
+                            marker[task_j] = i;
+                            // task_i is parent of task_j:
+                            parent[i].insert(task_j);
+                            child[task_j].insert(i);
+                        }
                     }
                 }
             }
@@ -430,17 +428,18 @@ struct sptr_solver_v2 {
                 int64_t beg = tasks[t].row_beg;
                 int64_t end = tasks[t].row_end;
 
-                for(int64_t r = beg; r < end; ++r) {
+                for(int64_t r = beg, k = tasks[t].loc_beg; r < end; ++r, ++k) {
                     int64_t i = order[r];
-                    int64_t row_beg = ptr[r];
-                    int64_t row_end = ptr[r+1];
+                    int64_t row_beg = ptr[tid][k];
+                    int64_t row_end = ptr[tid][k+1];
                     double X = 0;
-                    for(int64_t j = row_beg; j < row_end; ++j)
-                        X += val[j] * x[col[j]];
+                    for(int64_t j = row_beg; j < row_end; ++j) {
+                        X += val[tid][j] * x[col[tid][j]];
+                    }
                     if (lower)
                         x[i] -= X;
                     else
-                        x[i] = D[r] * (x[i] - X);
+                        x[i] = D[tid][k] * (x[i] - X);
                 }
 
                 // notify children they are free to go
