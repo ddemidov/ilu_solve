@@ -3,6 +3,7 @@
 #include <set>
 #include <algorithm>
 #include <numeric>
+#include <memory>
 
 #include <atomic>
 
@@ -11,6 +12,8 @@
 #include <amgcl/io/binary.hpp>
 #include <amgcl/backend/builtin.hpp>
 #include <amgcl/profiler.hpp>
+
+#include <vexcl/vexcl.hpp>
 
 #ifdef _OPENMP
 #  include <omp.h>
@@ -646,6 +649,134 @@ struct sptr_solver_v3 {
     }
 };
 
+vex::Context& ctx() {
+    static vex::Context c(vex::Filter::Env && vex::Filter::Count(1));
+    return c;
+}
+
+template <bool lower>
+struct sptr_solver_vexcl {
+    int64_t nlev;
+
+    std::vector< vex::sparse::ell<double,int64_t> > L;
+    std::vector< vex::vector<int64_t> > I;
+    std::vector< vex::vector<double>  > D;
+
+    sptr_solver_vexcl(
+        int64_t n,
+        std::vector<int64_t> const &_ptr,
+        std::vector<int64_t> const &_col,
+        std::vector<double>  const &_val,
+        const double *_D = 0) : nlev(0)
+    {
+        std::vector<int64_t> level(n, 0);
+        std::vector<int64_t> order(n, 0);
+
+
+        // 1. split rows into levels.
+        int64_t beg = lower ? 0 : n-1;
+        int64_t end = lower ? n :  -1;
+        int64_t inc = lower ? 1 :  -1;
+
+        for(int64_t i = beg; i != end; i += inc) {
+            int64_t l = level[i];
+
+            for(int64_t j = _ptr[i]; j < _ptr[i+1]; ++j)
+                l = std::max(l, level[_col[j]]+1);
+
+            level[i] = l;
+            nlev = std::max(nlev, l+1);
+        }
+
+
+        // 2. reorder matrix rows.
+        std::vector<int64_t> start(nlev+1, 0);
+
+        for(int64_t i = 0; i < n; ++i)
+            ++start[level[i]+1];
+
+        std::partial_sum(start.begin(), start.end(), start.begin());
+
+        for(int64_t i = 0; i < n; ++i)
+            order[start[level[i]]++] = i;
+
+        std::rotate(start.begin(), start.end() - 1, start.end());
+        start[0] = 0;
+
+
+        // 3. Create levels
+        L.reserve(nlev);
+        I.reserve(nlev);
+        if (!lower) D.reserve(nlev);
+
+        for(int64_t lev = 0; lev < nlev; ++lev) {
+            // split each level into tasks.
+            int64_t rows = start[lev+1] - start[lev];
+
+            std::vector<int64_t> ptr(rows + 1); ptr[0] = 0;
+            std::vector<int64_t> ord(rows);
+            std::vector<double>  dia; if (!lower) dia.resize(rows);
+
+            // count nonzeros in the current level
+            for(int64_t i = start[lev], k = 0; i < start[lev+1]; ++i, ++k) {
+                int64_t j = order[i];
+                ptr[k+1] = ptr[k] + _ptr[j+1] - _ptr[j];
+                ord[k] = j;
+                if (!lower) dia[k] = _D[j];
+            }
+
+            std::vector<int64_t> col(ptr[rows]);
+            std::vector<double>  val(ptr[rows]);
+
+            // copy nonzeros
+            for(int64_t i = start[lev], k = 0; i < start[lev+1]; ++i, ++k) {
+                int64_t o = ord[k];
+                int64_t h = ptr[k];
+                for(int j = _ptr[o]; j < _ptr[o+1]; ++j) {
+                    col[h] = _col[j];
+                    val[h] = _val[j];
+                    ++h;
+                }
+            }
+
+            L.emplace_back(ctx(), rows, n, ptr, col, val);
+            I.emplace_back(ctx(), ord);
+            if (!lower) D.emplace_back(ctx(), dia);
+        }
+    }
+
+    template <class Vector>
+    void solve(Vector &x) const {
+        for(int64_t i = 0; i < nlev; ++i) {
+            using namespace vex;
+
+            auto _x = tag<1>(x);
+            auto _I = tag<2>(I[i]);
+            if (lower) {
+                permutation(_I)(_x) -= L[i] * _x;
+            } else {
+                permutation(_I)(_x) = D[i] * (permutation(_I)(_x) - L[i] * _x);
+            }
+        }
+    }
+
+    static int num_threads() {
+#ifdef _OPENMP
+        return omp_get_max_threads();
+#else
+        return 1;
+#endif
+    }
+
+    static int thread_id() {
+#ifdef _OPENMP
+        return omp_get_thread_num();
+#else
+        return 0;
+#endif
+    }
+};
+
 //---------------------------------------------------------------------------
 template <template <bool> class SPTR_Solver>
 class ilu_solver {
@@ -672,7 +803,8 @@ class ilu_solver {
         {
         }
 
-        void solve(amgcl::backend::numa_vector<double> &x) const {
+        template <class Vector>
+        void solve(Vector &x) const {
             L.solve(x);
             U.solve(x);
         }
@@ -741,6 +873,7 @@ int main(int argc, char *argv[]) {
     amgcl::backend::numa_vector<double> x1(n, true);
     amgcl::backend::numa_vector<double> x2(n, true);
     amgcl::backend::numa_vector<double> x3(n, true);
+    std::vector<double> x4(n);
 
     std::fill_n(xs.data(), n, 1.0);
     std::fill_n(x1.data(), n, 1.0);
@@ -795,13 +928,36 @@ int main(int argc, char *argv[]) {
             S.solve(x3);
     }
 
+    {
+        std::cout << "vexcl..." << std::endl;
+        ctx().finish();
+        scoped_tic t1(prof, "vexcl");
+
+        prof.tic("setup");
+        ilu_solver<sptr_solver_vexcl> S(n, Lptr, Lcol, Lval, Uptr, Ucol, Uval, D);
+        ctx().finish();
+        prof.toc("setup");
+
+        vex::vector<double> x(ctx(), n); x = 1.0;
+
+        ctx().finish();
+        scoped_tic t2(prof, "solve");
+        for(int i = 0; i < niters; ++i)
+            S.solve(x);
+        ctx().finish();
+
+        vex::copy(x, x4);
+    }
+
     axpby(1, xs, -1, x1);
     axpby(1, xs, -1, x2);
     axpby(1, xs, -1, x3);
+    axpby(1, xs, -1, x4);
 
     std::cout << "delta (v1): " << inner_product(x1, x1) << std::endl;
     std::cout << "delta (v2): " << inner_product(x2, x2) << std::endl;
     std::cout << "delta (v3): " << inner_product(x3, x3) << std::endl;
+    std::cout << "delta (v4): " << amgcl::backend::inner_product(x4, x4) << std::endl;
 
     std::cout << prof << std::endl;
 }
